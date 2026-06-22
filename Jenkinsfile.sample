@@ -1,0 +1,250 @@
+pipeline {
+    agent any
+
+    environment {
+        /*
+         * Update these values per application.
+         */
+        AWS_REGION = "us-east-1"
+        AWS_ACCOUNT_ID = "123456789012"
+        ECR_REPOSITORY = "my-org/my-app"
+
+        ECR_REGISTRY = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+        ECR_IMAGE = "${ECR_REGISTRY}/${ECR_REPOSITORY}"
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Set Build Metadata') {
+            steps {
+                script {
+                    /*
+                     * Defaults. Unsupported branches/tags will complete successfully
+                     * without building so GitHub checks do not fail unnecessarily.
+                     */
+                    env.SHOULD_BUILD_IMAGE = "false"
+                    env.SHOULD_DEPLOY_TO_PORTAINER = "false"
+                    env.SKIP_REASON = ""
+
+                    env.GIT_SHA = sh(
+                        script: 'git rev-parse --short=12 HEAD',
+                        returnStdout: true
+                    ).trim()
+
+                    env.SHA_TAG = "sha-${env.GIT_SHA}"
+
+                    /*
+                     * Build behavior:
+                     *
+                     * dev branch:
+                     *   - Builds image
+                     *   - Pushes :dev
+                     *   - Pushes :dev-BUILD_NUMBER
+                     *   - Pushes :sha-xxxx
+                     *   - Triggers dev Portainer webhook
+                     *
+                     * main branch:
+                     *   - Builds image
+                     *   - Pushes :main
+                     *   - Pushes :sha-xxxx
+                     *   - Does NOT trigger Portainer
+                     *
+                     * release tag vX.Y.Z:
+                     *   - Builds image
+                     *   - Pushes :latest
+                     *   - Pushes :vX.Y.Z
+                     *   - Pushes :sha-xxxx
+                     *   - Triggers prod Portainer webhook
+                     *
+                     * anything else:
+                     *   - Does not build
+                     *   - Reports SUCCESS back to GitHub
+                     */
+
+                    if (env.TAG_NAME) {
+                        if (env.TAG_NAME ==~ /^v[0-9]+\\.[0-9]+\\.[0-9]+.*$/) {
+                            env.IMAGE_VERSION_TAG = env.TAG_NAME
+                            env.CHANNEL_TAG = "latest"
+                            env.PORTAINER_WEBHOOK_CREDENTIAL = "portainer-prod-webhook"
+                            env.SHOULD_BUILD_IMAGE = "true"
+                            env.SHOULD_DEPLOY_TO_PORTAINER = "true"
+                            env.IS_RELEASE = "true"
+                        } else {
+                            env.SKIP_REASON = "Tag ${env.TAG_NAME} is not a release tag. Expected vX.Y.Z."
+                            env.SHOULD_BUILD_IMAGE = "false"
+                            env.SHOULD_DEPLOY_TO_PORTAINER = "false"
+                            env.IS_RELEASE = "false"
+                        }
+
+                    } else if (env.BRANCH_NAME == "main") {
+                        env.IMAGE_VERSION_TAG = ""
+                        env.CHANNEL_TAG = "main"
+                        env.PORTAINER_WEBHOOK_CREDENTIAL = ""
+                        env.SHOULD_BUILD_IMAGE = "true"
+                        env.SHOULD_DEPLOY_TO_PORTAINER = "false"
+                        env.IS_RELEASE = "false"
+
+                    } else if (env.BRANCH_NAME == "dev") {
+                        env.IMAGE_VERSION_TAG = "dev-${env.BUILD_NUMBER}"
+                        env.CHANNEL_TAG = "dev"
+                        env.PORTAINER_WEBHOOK_CREDENTIAL = "portainer-dev-webhook"
+                        env.SHOULD_BUILD_IMAGE = "true"
+                        env.SHOULD_DEPLOY_TO_PORTAINER = "true"
+                        env.IS_RELEASE = "false"
+
+                    } else {
+                        env.SKIP_REASON = "Skipping ${env.BRANCH_NAME}. Only dev, main, and release tags are built."
+                        env.SHOULD_BUILD_IMAGE = "false"
+                        env.SHOULD_DEPLOY_TO_PORTAINER = "false"
+                        env.IS_RELEASE = "false"
+                    }
+
+                    echo "Branch: ${env.BRANCH_NAME}"
+                    echo "Tag: ${env.TAG_NAME}"
+                    echo "Git SHA: ${env.GIT_SHA}"
+                    echo "ECR image: ${env.ECR_IMAGE}"
+                    echo "Channel tag: ${env.CHANNEL_TAG}"
+                    echo "Version tag: ${env.IMAGE_VERSION_TAG}"
+                    echo "SHA tag: ${env.SHA_TAG}"
+                    echo "Should build image: ${env.SHOULD_BUILD_IMAGE}"
+                    echo "Deploy to Portainer: ${env.SHOULD_DEPLOY_TO_PORTAINER}"
+
+                    if (env.SHOULD_BUILD_IMAGE != "true") {
+                        echo "Build skipped successfully: ${env.SKIP_REASON}"
+                        currentBuild.description = env.SKIP_REASON
+                    }
+                }
+            }
+        }
+
+        stage('Login to ECR') {
+            when {
+                expression {
+                    return env.SHOULD_BUILD_IMAGE == "true"
+                }
+            }
+            steps {
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',
+                    credentialsId: 'aws-ecr-creds',
+                    accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                    secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                ]]) {
+                    sh '''
+                        aws ecr get-login-password --region "$AWS_REGION" \
+                          | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+                    '''
+                }
+            }
+        }
+
+        stage('Build Docker Image') {
+            when {
+                expression {
+                    return env.SHOULD_BUILD_IMAGE == "true"
+                }
+            }
+            steps {
+                sh '''
+                    docker build \
+                      -t "$ECR_IMAGE:$CHANNEL_TAG" \
+                      -t "$ECR_IMAGE:$SHA_TAG" \
+                      .
+                '''
+            }
+        }
+
+        stage('Tag Versioned Image') {
+            when {
+                expression {
+                    return env.SHOULD_BUILD_IMAGE == "true" && env.IMAGE_VERSION_TAG?.trim()
+                }
+            }
+            steps {
+                sh '''
+                    docker tag "$ECR_IMAGE:$CHANNEL_TAG" "$ECR_IMAGE:$IMAGE_VERSION_TAG"
+                '''
+            }
+        }
+
+        stage('Push Docker Images') {
+            when {
+                expression {
+                    return env.SHOULD_BUILD_IMAGE == "true"
+                }
+            }
+            steps {
+                sh '''
+                    docker push "$ECR_IMAGE:$CHANNEL_TAG"
+                    docker push "$ECR_IMAGE:$SHA_TAG"
+
+                    if [ -n "$IMAGE_VERSION_TAG" ]; then
+                      docker push "$ECR_IMAGE:$IMAGE_VERSION_TAG"
+                    fi
+                '''
+            }
+        }
+
+        stage('Redeploy Portainer Stack') {
+            when {
+                expression {
+                    return env.SHOULD_DEPLOY_TO_PORTAINER == "true"
+                }
+            }
+            steps {
+                script {
+                    withCredentials([string(
+                        credentialsId: env.PORTAINER_WEBHOOK_CREDENTIAL,
+                        variable: 'PORTAINER_WEBHOOK'
+                    )]) {
+                        sh '''
+                            curl -fsSL -X POST "$PORTAINER_WEBHOOK"
+                        '''
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            script {
+                if (env.SHOULD_BUILD_IMAGE == "true") {
+                    echo "Successfully built and pushed ${env.ECR_IMAGE}:${env.CHANNEL_TAG}"
+
+                    if (env.IMAGE_VERSION_TAG?.trim()) {
+                        echo "Versioned image pushed: ${env.ECR_IMAGE}:${env.IMAGE_VERSION_TAG}"
+                    }
+
+                    echo "SHA image pushed: ${env.ECR_IMAGE}:${env.SHA_TAG}"
+
+                    if (env.SHOULD_DEPLOY_TO_PORTAINER == "true") {
+                        echo "Portainer deployment triggered."
+                    } else {
+                        echo "Portainer deployment skipped."
+                    }
+                } else {
+                    echo "Build intentionally skipped. Reporting success to GitHub."
+                }
+            }
+        }
+
+        failure {
+            echo "Build, push, or deployment failed."
+        }
+
+        always {
+            script {
+                if (env.SHOULD_BUILD_IMAGE == "true") {
+                    sh '''
+                        docker logout "$ECR_REGISTRY" || true
+                    '''
+                }
+            }
+        }
+    }
+}
